@@ -21,6 +21,14 @@ func respondJSON(
 	json.NewEncoder(w).Encode(data)
 }
 
+type MachineState struct {
+	State     int    `json:"state"`
+	MaxRam    uint64 `json:"max_ram"`
+	Ram       uint64 `json:"ram"`
+	CoreCount uint   `json:"core_count"`
+	CpuTime   uint64 `json:"cup_time"`
+}
+
 func main() {
 	// cnn, err := libvirt.NewConnect("qemu:///system")
 	cnn, err := libvirt.NewConnect("qemu:///session")
@@ -132,7 +140,14 @@ func main() {
 			respondJSON(resp, 500, "Ошибка получения состояния VM")
 			return
 		}
-		respondJSON(resp, 200, state)
+		machineState := MachineState{
+			State:     int(state.State),
+			MaxRam:    state.MaxMem,
+			Ram:       state.Memory,
+			CoreCount: state.NrVirtCpu,
+			CpuTime:   state.CpuTime,
+		}
+		respondJSON(resp, 200, machineState)
 	})
 	http.ListenAndServe("0.0.0.0:8080", r)
 }
