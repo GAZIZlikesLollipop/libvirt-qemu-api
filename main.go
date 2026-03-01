@@ -50,23 +50,30 @@ func main() {
 		<cpu mode='host-passthrough'/>
 		<devices>
 			<disk type='file' device='disk'>
-			<driver name='qemu' type='qcow2'/>
-			<source file='/home/bob/fun/ubuntu-vm/ubuntu.qcow2'/>
-			<target dev='vda' bus='virtio'/>
+				<driver name='qemu' type='qcow2'/>
+				<source file='/home/bob/Public/ubuntu-vm/ubuntu.qcow2'/>
+				<target dev='vda' bus='virtio'/>
 			</disk>
 			<disk type='file' device='cdrom'>
-			<source file='/home/bob/fun/ubuntu-vm/ubuntu-24.04.4-live-server-amd64.iso'/>
-			<target dev='sda' bus='sata'/>
-			<readonly/>
+				<source file='/home/bob/Public/ubuntu-vm/ubuntu-24.04.4-live-server-amd64.iso'/>
+				<target dev='sda' bus='sata'/>
+				<readonly/>
 			</disk>
 			<interface type='user'>
+				<backend type='passt'/>
 				<model type='virtio'/>
+				<portForward proto='tcp'>
+					<range start='2222' to='22'/>
+				</portForward>
 			</interface>
+			<channel type='unix'>
+				<target type='virtio' name='org.qemu.guest_agent.0'/>
+			</channel>
 			<graphics type='spice' port='5930'>
-			<image compression='off'/>
+				<image compression='off'/>
 			</graphics>
 			<video>
-			<model type='qxl'/>
+				<model type='qxl'/>
 			</video>
 		</devices>
 	</domain>`
