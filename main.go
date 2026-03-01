@@ -47,6 +47,14 @@ func main() {
 			<boot dev='hd'/>
 			<boot dev='cdrom'/>
 		</os>
+		<features>
+			<acpi/>
+			<apic/>
+		</features>
+		<pm>
+			<suspend-to-mem enabled='yes'/>
+			<suspend-to-disk enabled='yes'/>
+		</pm>
 		<cpu mode='host-passthrough'/>
 		<devices>
 			<disk type='file' device='disk'>
@@ -77,11 +85,7 @@ func main() {
 			</video>
 		</devices>
 	</domain>`
-	// in interface scope 👇🏾
-	// <backend type='passt'/>
-	// <portForward proto='tcp'>
-	// 	<range start='2222' to='22'/>
-	// </portForward>
+
 	var dom *libvirt.Domain
 	dom, err = cnn.LookupDomainByName("ubuntu-vm")
 	if err != nil {
