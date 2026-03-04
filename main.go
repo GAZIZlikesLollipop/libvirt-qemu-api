@@ -24,8 +24,7 @@ func respondJSON(
 
 type MachineState struct {
 	State     int    `json:"state"`
-	MaxRam    uint64 `json:"max_ram"`
-	Ram       uint64 `json:"ram"`
+	Memory    uint64 `json:"memory"`
 	CoreCount uint   `json:"core_count"`
 	CpuTime   uint64 `json:"cpu_time"`
 }
@@ -142,10 +141,18 @@ func main() {
 		respondJSON(resp, 200, "Виртуальная машина успешно приостановлена!")
 	})
 	r.Get("/resume", func(resp http.ResponseWriter, req *http.Request) {
-		if err := dom.Resume(); err != nil {
-			log.Println("Ошибка возообновления виртуальной машины: ", err)
-			respondJSON(resp, 500, "Ошибка возообновления виртульной машины")
-			return
+		if state, _, _ := dom.GetState(); state == 7 {
+			if err := dom.PMWakeup(0); err != nil {
+				log.Println("Ошибка возообновления виртуальной машины: ", err)
+				respondJSON(resp, 500, "Ошибка возообновления виртульной машины")
+				return
+			}
+		} else {
+			if err := dom.Resume(); err != nil {
+				log.Println("Ошибка возообновления виртуальной машины: ", err)
+				respondJSON(resp, 500, "Ошибка возообновления виртульной машины")
+				return
+			}
 		}
 		respondJSON(resp, 200, "Виртуальная машина успешно возообновлена!")
 	})
@@ -158,8 +165,7 @@ func main() {
 		}
 		machineState := MachineState{
 			State:     int(state.State),
-			MaxRam:    state.MaxMem,
-			Ram:       state.Memory,
+			Memory:    state.MaxMem,
 			CoreCount: state.NrVirtCpu,
 			CpuTime:   state.CpuTime,
 		}
