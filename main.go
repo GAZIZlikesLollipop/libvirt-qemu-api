@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/cors"
+	"github.com/gorilla/websocket"
 	"libvirt.org/go/libvirt"
 )
 
@@ -22,20 +22,235 @@ func respondJSON(
 	json.NewEncoder(w).Encode(data)
 }
 
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
+
+type Hub struct {
+	clients    map[*websocket.Conn]bool
+	brodcast   chan []byte
+	register   chan *websocket.Conn
+	unRegister chan *websocket.Conn
+}
+
+func newHub() Hub {
+	return Hub{
+		clients:    make(map[*websocket.Conn]bool),
+		brodcast:   make(chan []byte),
+		register:   make(chan *websocket.Conn),
+		unRegister: make(chan *websocket.Conn),
+	}
+}
+
+func (h *Hub) run() {
+	for {
+		select {
+		case conn := <-h.register:
+			h.clients[conn] = true
+		case conn := <-h.unRegister:
+			delete(h.clients, conn)
+			conn.Close()
+		case data := <-h.brodcast:
+			for conn := range h.clients {
+				conn.WriteMessage(websocket.TextMessage, data)
+			}
+		}
+	}
+}
+
+func listenState(h *Hub, dom *libvirt.Domain) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			fmt.Println("Ошибка создания webSocket соединения: ", err)
+			w.Write([]byte("Ошибка создения webSocket соединения"))
+			return
+		}
+		h.register <- conn
+		for {
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				log.Println(err)
+				h.unRegister <- conn
+				break
+			}
+			state, err := dom.GetInfo()
+			var domainStates = map[libvirt.DomainState]string{
+				libvirt.DOMAIN_NOSTATE:     "Unknown",
+				libvirt.DOMAIN_RUNNING:     "Started",
+				libvirt.DOMAIN_BLOCKED:     "Resumed",
+				libvirt.DOMAIN_PAUSED:      "Suspended",
+				libvirt.DOMAIN_SHUTDOWN:    "Shutdown",
+				libvirt.DOMAIN_CRASHED:     "Crashed",
+				libvirt.DOMAIN_PMSUSPENDED: "Pmsuspended",
+				libvirt.DOMAIN_SHUTOFF:     "Stopped",
+			}
+			data, err := json.Marshal(
+				&MachineState{
+					Event:     domainStates[state.State],
+					Detail:    "",
+					Memory:    state.MaxMem,
+					CoreCount: state.NrVirtCpu,
+					CpuTime:   state.CpuTime,
+				},
+			)
+			if err != nil {
+				log.Println("Ошибка преобрзования события в json: ", err)
+				return
+			}
+			conn.WriteMessage(websocket.TextMessage, data)
+		}
+	}
+}
+
 type MachineState struct {
-	State     int    `json:"state"`
+	Event     string `json:"event"`
+	Detail    string `json:"detail"`
 	Memory    uint64 `json:"memory"`
 	CoreCount uint   `json:"core_count"`
 	CpuTime   uint64 `json:"cpu_time"`
 }
 
-func main() {
+func eventAndDetail(event *libvirt.DomainEventLifecycle) (string, string) {
+	switch event.Event {
+
+	case libvirt.DOMAIN_EVENT_DEFINED:
+		details := map[libvirt.DomainEventDefinedDetailType]string{
+			libvirt.DOMAIN_EVENT_DEFINED_ADDED:         "added",
+			libvirt.DOMAIN_EVENT_DEFINED_UPDATED:       "updated",
+			libvirt.DOMAIN_EVENT_DEFINED_RENAMED:       "renamed",
+			libvirt.DOMAIN_EVENT_DEFINED_FROM_SNAPSHOT: "from snapshot",
+		}
+		d, ok := details[libvirt.DomainEventDefinedDetailType(event.Detail)]
+		if !ok {
+			d = "unknown"
+		}
+		return "Defined", d
+
+	case libvirt.DOMAIN_EVENT_UNDEFINED:
+		details := map[libvirt.DomainEventUndefinedDetailType]string{
+			libvirt.DOMAIN_EVENT_UNDEFINED_REMOVED: "removed",
+			libvirt.DOMAIN_EVENT_UNDEFINED_RENAMED: "renamed",
+		}
+		d, ok := details[libvirt.DomainEventUndefinedDetailType(event.Detail)]
+		if !ok {
+			d = "unknown"
+		}
+		return "Undefined", d
+
+	case libvirt.DOMAIN_EVENT_STARTED:
+		details := map[libvirt.DomainEventStartedDetailType]string{
+			libvirt.DOMAIN_EVENT_STARTED_BOOTED:        "booted",
+			libvirt.DOMAIN_EVENT_STARTED_MIGRATED:      "migrated from another host",
+			libvirt.DOMAIN_EVENT_STARTED_RESTORED:      "restored from saved state",
+			libvirt.DOMAIN_EVENT_STARTED_FROM_SNAPSHOT: "started from snapshot",
+			libvirt.DOMAIN_EVENT_STARTED_WAKEUP:        "woke up from sleep",
+		}
+		d, ok := details[libvirt.DomainEventStartedDetailType(event.Detail)]
+		if !ok {
+			d = "unknown"
+		}
+		return "Started", d
+
+	case libvirt.DOMAIN_EVENT_SUSPENDED:
+		details := map[libvirt.DomainEventSuspendedDetailType]string{
+			libvirt.DOMAIN_EVENT_SUSPENDED_PAUSED:          "paused by user",
+			libvirt.DOMAIN_EVENT_SUSPENDED_MIGRATED:        "paused during migration",
+			libvirt.DOMAIN_EVENT_SUSPENDED_IOERROR:         "paused due to disk error",
+			libvirt.DOMAIN_EVENT_SUSPENDED_WATCHDOG:        "paused by watchdog",
+			libvirt.DOMAIN_EVENT_SUSPENDED_RESTORED:        "paused after restore",
+			libvirt.DOMAIN_EVENT_SUSPENDED_FROM_SNAPSHOT:   "paused from snapshot",
+			libvirt.DOMAIN_EVENT_SUSPENDED_API_ERROR:       "paused due to api error",
+			libvirt.DOMAIN_EVENT_SUSPENDED_POSTCOPY:        "paused during postcopy migration",
+			libvirt.DOMAIN_EVENT_SUSPENDED_POSTCOPY_FAILED: "paused because postcopy failed",
+		}
+		d, ok := details[libvirt.DomainEventSuspendedDetailType(event.Detail)]
+		if !ok {
+			d = "unknown"
+		}
+		return "Suspended", d
+
+	case libvirt.DOMAIN_EVENT_RESUMED:
+		details := map[libvirt.DomainEventResumedDetailType]string{
+			libvirt.DOMAIN_EVENT_RESUMED_UNPAUSED:      "resumed by user",
+			libvirt.DOMAIN_EVENT_RESUMED_MIGRATED:      "resumed after migration",
+			libvirt.DOMAIN_EVENT_RESUMED_FROM_SNAPSHOT: "resumed from snapshot",
+			libvirt.DOMAIN_EVENT_RESUMED_POSTCOPY:      "resumed in postcopy migration",
+		}
+		d, ok := details[libvirt.DomainEventResumedDetailType(event.Detail)]
+		if !ok {
+			d = "unknown"
+		}
+		return "Resumed", d
+
+	case libvirt.DOMAIN_EVENT_STOPPED:
+		details := map[libvirt.DomainEventStoppedDetailType]string{
+			libvirt.DOMAIN_EVENT_STOPPED_SHUTDOWN:      "shut down gracefully",
+			libvirt.DOMAIN_EVENT_STOPPED_DESTROYED:     "force killed",
+			libvirt.DOMAIN_EVENT_STOPPED_CRASHED:       "crashed",
+			libvirt.DOMAIN_EVENT_STOPPED_MIGRATED:      "migrated to another host",
+			libvirt.DOMAIN_EVENT_STOPPED_SAVED:         "saved to disk",
+			libvirt.DOMAIN_EVENT_STOPPED_FAILED:        "stopped due to host error",
+			libvirt.DOMAIN_EVENT_STOPPED_FROM_SNAPSHOT: "stopped by snapshot revert",
+		}
+		d, ok := details[libvirt.DomainEventStoppedDetailType(event.Detail)]
+		if !ok {
+			d = "unknown"
+		}
+		return "Stopped", d
+
+	case libvirt.DOMAIN_EVENT_SHUTDOWN:
+		details := map[libvirt.DomainEventShutdownDetailType]string{
+			libvirt.DOMAIN_EVENT_SHUTDOWN_FINISHED: "finished shutting down",
+			libvirt.DOMAIN_EVENT_SHUTDOWN_GUEST:    "guest initiated shutdown",
+			libvirt.DOMAIN_EVENT_SHUTDOWN_HOST:     "host initiated shutdown",
+		}
+		d, ok := details[libvirt.DomainEventShutdownDetailType(event.Detail)]
+		if !ok {
+			d = "unknown"
+		}
+		return "Shutdown", d
+
+	case libvirt.DOMAIN_EVENT_CRASHED:
+		details := map[libvirt.DomainEventCrashedDetailType]string{
+			libvirt.DOMAIN_EVENT_CRASHED_PANICKED:    "kernel panic",
+			libvirt.DOMAIN_EVENT_CRASHED_CRASHLOADED: "crash kernel loaded",
+		}
+		d, ok := details[libvirt.DomainEventCrashedDetailType(event.Detail)]
+		if !ok {
+			d = "unknown"
+		}
+		return "Crashed", d
+
+	case libvirt.DOMAIN_EVENT_PMSUSPENDED:
+		details := map[libvirt.DomainEventPMSuspendedDetailType]string{
+			libvirt.DOMAIN_EVENT_PMSUSPENDED_MEMORY: "suspended to ram",
+			libvirt.DOMAIN_EVENT_PMSUSPENDED_DISK:   "suspended to disk",
+		}
+		d, ok := details[libvirt.DomainEventPMSuspendedDetailType(event.Detail)]
+		if !ok {
+			d = "unknown"
+		}
+		return "Pmsuspended", d
+	}
+
+	return "Unknown", "unknown"
+}
+
+func initLibvirt(h *Hub) (*libvirt.Domain, *int, *libvirt.Connect, error) {
+	if err := libvirt.EventRegisterDefaultImpl(); err != nil {
+		log.Println("Ошибка регистрации кастомного event loop")
+		return nil, nil, nil, err
+	}
 	cnn, err := libvirt.NewConnect("qemu:///system")
 	if err != nil {
-		fmt.Println("Ошибка подключения к гипервизору: ", err)
-		os.Exit(1)
+		log.Println("Ошибка подключения к гипервизору")
+		return nil, nil, nil, err
 	}
-	defer cnn.Close()
 	const domainXML = `
 	<domain type='kvm'>
 		<name>ubuntu-vm</name>
@@ -90,10 +305,62 @@ func main() {
 	if err != nil {
 		dom, err = cnn.DomainDefineXML(domainXML)
 		if err != nil {
-			log.Fatalln("Ошибка создания виртуальной машины: ", err)
+			log.Println("Ошибка создания виртуальной машины")
+			return nil, nil, nil, err
 		}
 	}
+
+	callbackId, err := cnn.DomainEventLifecycleRegister(
+		dom,
+		func(c *libvirt.Connect, d *libvirt.Domain, event *libvirt.DomainEventLifecycle) {
+			evnt, detail := eventAndDetail(event)
+			state, err := d.GetInfo()
+			if err != nil {
+				log.Println("Ошибка получения инфорамции об виртуальной машине: ", err)
+				return
+			}
+			data, err := json.Marshal(
+				&MachineState{
+					Event:     evnt,
+					Detail:    detail,
+					Memory:    state.MaxMem,
+					CoreCount: state.NrVirtCpu,
+					CpuTime:   state.CpuTime,
+				},
+			)
+			if err != nil {
+				log.Println("Ошибка преобрзования события в json: ", err)
+				return
+			}
+			h.brodcast <- data
+		},
+	)
+	if err != nil {
+		log.Println("Ошибка регистрации на поток свежик данных об lifecycle of machine")
+		return nil, nil, nil, err
+	}
+	go func() {
+		for {
+			if err := libvirt.EventRunDefaultImpl(); err != nil {
+				log.Println("event loop ошибка:", err)
+			}
+		}
+	}()
+	return dom, &callbackId, cnn, nil
+}
+
+func main() {
+	hub := newHub()
+	go hub.run()
+
+	dom, cbkId, cnn, err := initLibvirt(&hub)
+	if err != nil {
+		panic(err)
+	}
 	defer dom.Free()
+	defer cnn.DomainEventDeregister(*cbkId)
+	defer cnn.Close()
+
 	r := chi.NewRouter()
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins: []string{"*"}, // или конкретный "*"
@@ -156,20 +423,6 @@ func main() {
 		}
 		respondJSON(resp, 200, "Виртуальная машина успешно возообновлена!")
 	})
-	r.Get("/state", func(resp http.ResponseWriter, req *http.Request) {
-		state, err := dom.GetInfo()
-		if err != nil {
-			log.Println("Ошибка получения состояния VM: ", err)
-			respondJSON(resp, 500, "Ошибка получения состояния VM")
-			return
-		}
-		machineState := MachineState{
-			State:     int(state.State),
-			Memory:    state.MaxMem,
-			CoreCount: state.NrVirtCpu,
-			CpuTime:   state.CpuTime,
-		}
-		respondJSON(resp, 200, machineState)
-	})
+	r.Get("/state", listenState(&hub, dom))
 	http.ListenAndServe("0.0.0.0:8080", r)
 }
